@@ -146,6 +146,18 @@ painter_device_t qp_st7789_make_spi_device(uint16_t panel_width, uint16_t panel_
     return NULL;
 }
 
+#ifdef QUANTUM_PAINTER_ST7789_SPI_ENABLE
+
+// Нормальное (тёмное) состояние этой панели — с включённой инверсией (INVON).
+// «Мигание» переключает панель в INVOFF, то есть в инвертированную картинку.
+bool qp_st7789_invert(painter_device_t device, bool invert) {
+    painter_driver_t *driver = (painter_driver_t *)device;
+    if (!driver) return false;
+    qp_comms_command(device, invert ? 0x20 : 0x21);
+    return true;
+}
+
+#endif // QUANTUM_PAINTER_ST7789_SPI_ENABLE
 #endif // QUANTUM_PAINTER_ST7789_SPI_ENABLE
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////

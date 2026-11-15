@@ -1,4 +1,8 @@
 #include "hid.h"
+
+#if defined(KEYBOARD_ergohaven_sm62)
+#    include "keyboards/ergohaven/sm62/screen_dash.h"
+#endif
 #include "sm62_trace.h"
 #include <string.h>
 #include "via.h"
@@ -784,6 +788,15 @@ typedef enum {
     _MEDIA_PROGRESS = 0xB1,
     _SM62_MEDIA_TITLE_CHUNK = 0xBB, /* offset, total UTF-8 bytes, up to 29 bytes */
 
+    /* Дашборд: экран целиком управляется хостом */
+    _DASH_BEGIN = 0xC0,
+    _DASH_TEXT,
+    _DASH_BAR,
+    _DASH_RECT,
+    _DASH_COMMIT,
+    _DASH_SCREEN,
+    _DASH_INVERT,
+
     _RELAY_FROM_DEVICE = 0xCC,
     _RELAY_TO_DEVICE,
 } hid_data_type;
@@ -808,6 +821,80 @@ void read_string(uint8_t *data, uint8_t length, char *string_data) {
     string_data[data_length] = '\0';
 }
 
+#if defined(KEYBOARD_ergohaven_sm62)
+static bool sm62_dash_is_local_side(uint8_t target);
+
+/* Разбор кадров дашборда: применяем локально только то, что адресовано этой половине. */
+
+static uint8_t sm62_dash_packet_target(uint8_t type, const uint8_t *data) {
+    /* у BEGIN адрес на позиции 2, у остальных пакетов — на позиции 1 */
+    return type == _DASH_BEGIN ? data[2] : data[1];
+}
+
+static bool sm62_dash_process_packet(uint8_t *data, uint8_t length) {
+    uint8_t type = data[0];
+    if (type < _DASH_BEGIN || type > _DASH_INVERT) return false;
+    if (length < 2) return true;
+    uint8_t target = sm62_dash_packet_target(type, data);
+    if (!sm62_dash_is_local_side(target)) return true;
+
+    switch (type) {
+        case _DASH_BEGIN:
+            if (length < 4) break;
+            sm62_dash_begin(data[1], target, data[3]);
+            break;
+        case _DASH_TEXT: {
+            if (length < 14) break;
+            uint16_t x     = data[3];
+            uint16_t y     = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
+            uint16_t w     = (uint16_t)data[6] | ((uint16_t)data[7] << 8);
+            uint8_t  font  = data[8] & 0x0F;
+            uint8_t  align = data[8] >> 4;
+            uint16_t color = (uint16_t)data[9] | ((uint16_t)data[10] << 8);
+            uint8_t  flags = data[11];
+            uint8_t  off   = data[12];
+            uint8_t  len   = data[13] <= length - 14 ? data[13] : length - 14;
+            sm62_dash_text(data[2], x, y, w, font, color, align, flags, off, data + 14, len);
+            break;
+        }
+        case _DASH_BAR: {
+            if (length < 22) break;
+            uint16_t x   = data[3];
+            uint16_t y   = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
+            uint16_t w   = (uint16_t)data[6] | ((uint16_t)data[7] << 8);
+            uint16_t h   = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
+            uint32_t pos = (uint32_t)data[10] | ((uint32_t)data[11] << 8) | ((uint32_t)data[12] << 16) | ((uint32_t)data[13] << 24);
+            uint32_t dur = (uint32_t)data[14] | ((uint32_t)data[15] << 8) | ((uint32_t)data[16] << 16) | ((uint32_t)data[17] << 24);
+            uint16_t fg  = (uint16_t)data[18] | ((uint16_t)data[19] << 8);
+            uint16_t bg  = (uint16_t)data[20] | ((uint16_t)data[21] << 8);
+            sm62_dash_bar(data[2], x, y, w, h, pos, dur, fg, bg);
+            break;
+        }
+        case _DASH_RECT: {
+            if (length < 13) break;
+            uint16_t x = data[3];
+            uint16_t y = (uint16_t)data[4] | ((uint16_t)data[5] << 8);
+            uint16_t w = (uint16_t)data[6] | ((uint16_t)data[7] << 8);
+            uint16_t h = (uint16_t)data[8] | ((uint16_t)data[9] << 8);
+            uint16_t c = (uint16_t)data[10] | ((uint16_t)data[11] << 8);
+            sm62_dash_rect(data[2], x, y, w, h, c, data[12]);
+            break;
+        }
+        case _DASH_COMMIT:
+            sm62_dash_commit();
+            break;
+        case _DASH_SCREEN:
+            break;
+        case _DASH_INVERT:
+            if (length >= 3) sm62_dash_invert(data[2] != 0);
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+#endif
+
 bool process_raw_hid_data(uint8_t *data, uint8_t length) {
 #if !defined(KEYBOARD_ergohaven_sm62)
     if (length < 3) return false;
@@ -816,6 +903,10 @@ bool process_raw_hid_data(uint8_t *data, uint8_t length) {
     if (length < 2) return false;
 #endif
     uint8_t data_type = data[0];
+
+#if defined(KEYBOARD_ergohaven_sm62)
+    if (sm62_dash_process_packet(data, length)) return true;
+#endif
 
     bool new_hid_data = false;
 
@@ -1100,6 +1191,50 @@ static bool process_via_custom_lighting(uint8_t *data, uint8_t length) {
  * Key transitions are retained separately per physical key, so a transient
  * split stall cannot leave a released key held on the other half. */
 #        define SM62_RELAY_TYPES 8
+/* Очередь адресованных кадров дашборда для второй половины. Пакеты идут как есть:
+ * слейв применяет их тем же разбором, target проверяется по его стороне. */
+#        define SM62_DASH_RELAY_SLOTS 48
+static uint8_t sm62_dash_rq[SM62_DASH_RELAY_SLOTS][32];
+static uint8_t sm62_dash_rq_len[SM62_DASH_RELAY_SLOTS];
+static volatile uint8_t sm62_dash_rq_head, sm62_dash_rq_tail;
+
+static bool sm62_dash_is_local_side(uint8_t target) {
+    if (target >= 2) return true;
+    return target == (is_keyboard_left() ? 0 : 1u);
+}
+
+static void sm62_dash_relay_push(const uint8_t *data, uint8_t length) {
+    if (length < 2) return;
+    uint8_t target = data[0] == _DASH_BEGIN ? (length >= 3 ? data[2] : 2) : data[1];
+    if (target < 2 && sm62_dash_is_local_side(target)) return; /* только для этой половины */
+    uint8_t next = (uint8_t)((sm62_dash_rq_head + 1) % SM62_DASH_RELAY_SLOTS);
+    if (next == sm62_dash_rq_tail) {
+        /* очередь переполнена — начинаем кадр заново, чтобы не копить мусор */
+        sm62_dash_rq_tail = sm62_dash_rq_head;
+    }
+    uint8_t copy = length > 32 ? 32 : length;
+    memcpy(sm62_dash_rq[sm62_dash_rq_head], data, copy);
+    sm62_dash_rq_len[sm62_dash_rq_head] = copy;
+    sm62_dash_rq_head = next;
+}
+
+static uint8_t sm62_dash_relay_pending_count(void) {
+    return (uint8_t)((sm62_dash_rq_head + SM62_DASH_RELAY_SLOTS - sm62_dash_rq_tail) % SM62_DASH_RELAY_SLOTS);
+}
+
+static bool sm62_dash_relay_pump(void) {
+    if (sm62_dash_rq_head == sm62_dash_rq_tail) return false;
+    uint8_t index = sm62_dash_rq_tail;
+    if (!transaction_rpc_send(RPC_SYNC_HID, sm62_dash_rq_len[index], sm62_dash_rq[index])) {
+        /* Напарник не отвечает: не зацикливаемся, иначе встанет весь главный цикл
+         * (клавиши перестают обрабатываться). Сбрасываем очередь до следующего кадра. */
+        sm62_dash_rq_tail = sm62_dash_rq_head;
+        return false;
+    }
+    sm62_dash_rq_tail = (uint8_t)((sm62_dash_rq_tail + 1) % SM62_DASH_RELAY_SLOTS);
+    return true;
+}
+
 static uint8_t sm62_relay_data[SM62_RELAY_TYPES][32];
 static uint8_t sm62_relay_length[SM62_RELAY_TYPES];
 static uint8_t sm62_relay_pending;
@@ -1141,6 +1276,10 @@ static void sm62_hid_relay_queue(const uint8_t *data, uint8_t length) {
         if (data[3]) sm62_key_pressed |= bit;
         else sm62_key_pressed &= ~bit;
         sm62_key_pending |= bit;
+        return;
+    }
+    if (data[0] >= _DASH_BEGIN && data[0] <= _DASH_INVERT) {
+        sm62_dash_relay_push(data, length);
         return;
     }
     if (data[0] == _SM62_MEDIA_TITLE_CHUNK) {
@@ -1186,11 +1325,16 @@ static void sm62_hid_relay_task(void) {
         sm62_relay_title_offset = 0;
         sm62_relay_remote_mode = remote_mode;
     }
-    if (!sm62_key_pending && !sm62_relay_pending) return;
+    if (!sm62_key_pending && !sm62_relay_pending && !sm62_dash_relay_pending_count()) return;
     if (!is_transport_connected()) return;
     uint32_t interval = sm62_relay_failed ? 50U : 10U;
     if (sm62_relay_last_attempt && timer_elapsed32(sm62_relay_last_attempt) < interval) return;
     sm62_relay_last_attempt = timer_read32();
+
+    if (sm62_dash_relay_pending_count()) {
+        if (sm62_dash_relay_pump()) sm62_relay_last_attempt = timer_read32();
+        return;
+    }
 
     if (sm62_key_pending) {
         uint8_t index = (uint8_t)__builtin_ctzll(sm62_key_pending);

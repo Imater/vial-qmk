@@ -39,5 +39,7 @@
  * @param spi_mode[in] the SPI mode to use when communicating with the display
  * @return the device handle used with all drawing routines in Quantum Painter
  */
+bool qp_st7789_invert(painter_device_t device, bool invert);
+
 painter_device_t qp_st7789_make_spi_device(uint16_t panel_width, uint16_t panel_height, pin_t chip_select_pin, pin_t dc_pin, pin_t reset_pin, uint16_t spi_divisor, int spi_mode);
 #endif // QUANTUM_PAINTER_ST7789_SPI_ENABLE

@@ -3,6 +3,7 @@
 
 #include "keyboards/ergohaven/sm62/render_alias.h"
 #include "display.h"
+#include "screen_dash.h"
 #include "hid.h"
 #include "src/display/eh_display.h"
 #include "src/eh_settings.h"
@@ -14,6 +15,7 @@ extern const eh_screen_t eh_screen_clock;
 extern const eh_screen_t eh_screen_player;
 extern const eh_screen_t eh_screen_keymap;
 extern const eh_screen_t eh_screen_orbit;
+extern const eh_screen_t eh_screen_dash;
 extern void sm62_main_frame_completed(void);
 extern void sm62_player_frame_completed(void);
 extern void sm62_orbit_frame_completed(void);
@@ -27,7 +29,7 @@ extern bool sm62_keymap_visual_active(void);
 extern bool sm62_keymap_observe_matrix(void);
 #endif
 
-typedef enum { SM62_SCREEN_CLOCK, SM62_SCREEN_PLAYER, SM62_SCREEN_KEYMAP, SM62_SCREEN_ORBIT } sm62_screen_t;
+typedef enum { SM62_SCREEN_CLOCK, SM62_SCREEN_PLAYER, SM62_SCREEN_KEYMAP, SM62_SCREEN_ORBIT, SM62_SCREEN_DASH } sm62_screen_t;
 static sm62_screen_t active_screen = SM62_SCREEN_CLOCK;
 static eh_screen_t current_screen;
 static bool orbit_initialized;
@@ -89,6 +91,9 @@ void display_housekeeping_task(void) {
 #if !defined(SM62_DUALCORE_RENDER)
     hid_housekeeping_task();
 #endif
+    /* инверсия применяется здесь: этот код выполняется всегда, независимо от
+     * активного экрана, поэтому не может «застрять» включённой */
+    sm62_dash_apply_invert();
 #ifdef LV_USE_COOPERATIVE_REFR
     /* Do not advance a view/frame lease while its pixels are in flight.
      * HID/split ownership still progresses on the ordinary main loop. */
@@ -141,16 +146,18 @@ void display_housekeeping_task(void) {
     bool local_hold = local_activity_seen && idle < sm62_local_keymap_hold_ms();
     bool frame_hold = active_screen == SM62_SCREEN_KEYMAP &&
                       (waiting_for_keymap_frame || timer_elapsed32(keymap_frame_at) < 32U);
-    if ((settings->keymap_enabled || settings->mode == 3) &&
+    if (((settings->keymap_enabled && layer_state != 0) || settings->mode == 3) &&
         (local_change || local_hold || sm62_keymap_visual_active() || frame_hold)) {
 #else
     uint32_t idle = last_matrix_activity_elapsed();
-    if ((settings->keymap_enabled || settings->mode == 3) &&
+    if (((settings->keymap_enabled && layer_state != 0) || settings->mode == 3) &&
         last_matrix_activity_time() != 0U && idle < sm62_local_keymap_hold_ms()) {
 #endif
         requested = SM62_SCREEN_KEYMAP;
     /* Idle/ORBIT is local too: split activity from the USB half must not
      * change the other half's visible screen. */
+    } else if (sm62_dash_has_frame()) {
+        requested = SM62_SCREEN_DASH;
     } else if (settings->mode == 2 ||
                (settings->ship_enabled && sm62_local_orbit_idle_ms(idle) >= (uint32_t)settings->ship_timeout_s * 1000U)) {
         requested = SM62_SCREEN_ORBIT;
@@ -161,6 +168,7 @@ void display_housekeeping_task(void) {
 
     if (requested != active_screen) {
         active_screen = requested;
+        sm62_dash_reset_invert();
 #if SM62_FAST_RETURN
         if (active_screen == SM62_SCREEN_KEYMAP) waiting_for_keymap_frame = true;
 #endif
@@ -173,6 +181,9 @@ void display_housekeeping_task(void) {
                 break;
             case SM62_SCREEN_KEYMAP:
                 current_screen = eh_screen_keymap;
+                break;
+            case SM62_SCREEN_DASH:
+                current_screen = eh_screen_dash;
                 break;
             case SM62_SCREEN_ORBIT:
                 if (!orbit_initialized) {
