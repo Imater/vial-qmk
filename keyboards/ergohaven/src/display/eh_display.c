@@ -413,11 +413,15 @@ const char *get_layout_label(uint8_t layout) {
     }
 }
 
+/* Аппаратная инверсия панели — для вспышек-алертов дашборда.
+ *
+ * Почему транзакция обязательна: qp_comms_start/stop забирают шину и отпускают
+ * её только после команды. Без них команда может попасть в середину передачи
+ * полосы LVGL и подвесить клавиатуру (дедлок с идущим флашем).
+ * Поэтому вызов допустим только из housekeep, никогда из обработчика USB. */
 void display_set_inverted(bool on) {
 #ifdef QUANTUM_PAINTER_ST7789_SPI_ENABLE
     if (!display) return;
-    /* Только из дисплейного контекста и в транзакции QP: иначе можно
-     * поймать дедлок с идущим LVGL-флашем. */
     qp_comms_start(display);
     qp_st7789_invert(display, on);
     qp_comms_stop(display);

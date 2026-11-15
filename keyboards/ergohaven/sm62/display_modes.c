@@ -29,6 +29,8 @@ extern bool sm62_keymap_visual_active(void);
 extern bool sm62_keymap_observe_matrix(void);
 #endif
 
+/* Экраны клавиатуры. DASH добавлен последним: он не настройка, а результат
+ * первого кадра от хоста, поэтому включается по sm62_dash_has_frame(). */
 typedef enum { SM62_SCREEN_CLOCK, SM62_SCREEN_PLAYER, SM62_SCREEN_KEYMAP, SM62_SCREEN_ORBIT, SM62_SCREEN_DASH } sm62_screen_t;
 static sm62_screen_t active_screen = SM62_SCREEN_CLOCK;
 static eh_screen_t current_screen;
@@ -92,7 +94,9 @@ void display_housekeeping_task(void) {
     hid_housekeeping_task();
 #endif
     /* инверсия применяется здесь: этот код выполняется всегда, независимо от
-     * активного экрана, поэтому не может «застрять» включённой */
+     * активного экрана, поэтому не может «застрять» включённой.
+     * Из обработчика USB инверсию звать нельзя: там уже идёт или вот-вот
+     * начнётся передача по SPI, и команда панели дерётся с флашем (был дедлок). */
     sm62_dash_apply_invert();
 #ifdef LV_USE_COOPERATIVE_REFR
     /* Do not advance a view/frame lease while its pixels are in flight.
@@ -146,10 +150,22 @@ void display_housekeeping_task(void) {
     bool local_hold = local_activity_seen && idle < sm62_local_keymap_hold_ms();
     bool frame_hold = active_screen == SM62_SCREEN_KEYMAP &&
                       (waiting_for_keymap_frame || timer_elapsed32(keymap_frame_at) < 32U);
+    /* Экран раскладки показываем только при ненулевом layer_state.
+     *
+     * Это вторая половина лечения потери клавиш. Раньше оверлей включался на
+     * любое движение матрицы, в том числе на обычную печать в базовом слое:
+     * каждое нажатие запускало полнокадровый перелив, а вместе с ним — окно,
+     * в котором матрица не сканируется. Теперь повседневный ввод экран не
+     * трогает вообще.
+     * settings->mode == 3 — явный режим «раскладка всегда», его уважаем.
+     * frame_hold держит кадр ещё 32 мс после отрисовки, чтобы быстрое нажатие
+     * с отпусканием между двумя кадрами не мигало экраном. */
     if (((settings->keymap_enabled && layer_state != 0) || settings->mode == 3) &&
         (local_change || local_hold || sm62_keymap_visual_active() || frame_hold)) {
 #else
     uint32_t idle = last_matrix_activity_elapsed();
+    /* То же условие для сборки без FAST_RETURN: см. пояснение выше про
+     * layer_state и окно, в котором не сканируется матрица. */
     if (((settings->keymap_enabled && layer_state != 0) || settings->mode == 3) &&
         last_matrix_activity_time() != 0U && idle < sm62_local_keymap_hold_ms()) {
 #endif
@@ -157,6 +173,9 @@ void display_housekeeping_task(void) {
     /* Idle/ORBIT is local too: split activity from the USB half must not
      * change the other half's visible screen. */
     } else if (sm62_dash_has_frame()) {
+        /* Дашборд включается сам, как только хост прислал первый кадр, и
+         * перекрывает режимы из настроек. Он идёт после keymap: раскладка
+         * важнее календаря, пока пользователь держит слой. */
         requested = SM62_SCREEN_DASH;
     } else if (settings->mode == 2 ||
                (settings->ship_enabled && sm62_local_orbit_idle_ms(idle) >= (uint32_t)settings->ship_timeout_s * 1000U)) {
@@ -168,6 +187,8 @@ void display_housekeeping_task(void) {
 
     if (requested != active_screen) {
         active_screen = requested;
+        /* Уходим с дашборда — снимаем инверсию, иначе следующий экран
+         * останется в негативе (инверсия живёт в самой панели, не в кадре). */
         sm62_dash_reset_invert();
 #if SM62_FAST_RETURN
         if (active_screen == SM62_SCREEN_KEYMAP) waiting_for_keymap_frame = true;

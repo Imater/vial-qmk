@@ -2,6 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // Универсальный экран: хост присылает элементы (текст, полоса, прямоугольник),
 // прошивка только раскладывает их по координатам. Никакой логики приложения здесь нет.
+//
+// Поток данных:
+//   1. hid.c разбирает пакеты 0xC0..0xC6 и складывает их в модель (elements[]);
+//   2. housekeep замечает dash_dirty и один раз перерисовывает изменённое;
+//   3. LVGL сам решает, какие пиксели перерисовать, и отдаёт их в SPI.
+//
+// Почему отрисовка не в обработчике HID: LVGL не реентерабелен по отношению к
+// идущему флашу. Вызов из USB-контекста попадает внутрь передачи по SPI и
+// вешает клавиатуру (проверено). Заодно это удешевляет кадр: несколько пакетов
+// подряд дают одну перерисовку, а не по одной на пакет.
 
 #include "keyboards/ergohaven/sm62/render_alias.h"
 #include "src/display/eh_display.h"
@@ -16,23 +26,27 @@ LV_FONT_DECLARE(sm62_font_zen_medium_20);
 LV_FONT_DECLARE(sm62_font_zen_regular_24);
 LV_FONT_DECLARE(sm62_font_zen_medium_28);
 
+/* Один элемент кадра. Модель полная: сюда попадает всё, что прислал хост,
+ * а LVGL-объект создаётся лениво и только когда элемент реально виден.
+ * rendered_type хранит тип, под который построен объект: label нельзя
+ * превратить в контейнер полосы, поэтому при смене типа объект пересоздаётся. */
 typedef struct {
     uint8_t  type; // 0 — пусто, 1 — текст, 2 — полоса, 3 — прямоугольник
     uint16_t x, y, w, h;
     uint8_t  font, align, flags, radius;
     uint16_t color, background;
-    uint32_t position, duration;
-    char     text[SM62_DASH_TEXT_BYTES + 1];
-    lv_obj_t *object;
-    lv_obj_t *fill;
-    uint8_t   rendered_type;
+    uint32_t position, duration; // заполнение полосы: position из duration
+    char     text[SM62_DASH_TEXT_BYTES + 1]; // строка целиком, склеена из кусков
+    lv_obj_t *object; // label или подложка полосы/прямоугольника
+    lv_obj_t *fill;   // заливка полосы, только у type == 2
+    uint8_t   rendered_type; // тип, под который построен object
 } dash_element_t;
 
 static dash_element_t elements[SM62_DASH_MAX_ELEMENTS];
-static lv_obj_t        *dash_root;
-static bool             dash_dirty;
-static bool             dash_frame_seen;
-static uint8_t          dash_count;
+static lv_obj_t        *dash_root;   // корневой контейнер экрана, создаётся при первом показе
+static bool             dash_dirty;  // модель изменилась, нужен рендер в housekeep
+static bool             dash_frame_seen; // хост присылал хотя бы один кадр
+static uint8_t          dash_count;  // сколько элементов в текущем кадре
 
 /* Цвета приходят в RGB565, LVGL ждёт компоненты 0..255. */
 static lv_color_t dash_color(uint16_t c) {
@@ -74,8 +88,10 @@ static lv_obj_t *make_box(lv_obj_t *parent, uint16_t x, uint16_t y, uint16_t w, 
     return box;
 }
 
-/* Битая UTF-8 (например, из-за разрезанного по байтам пакета) вешает LVGL.
- * Заменяем всё невалидное на '?'. */
+/* Битая UTF-8 вешает LVGL (он уходит в бесконечный разбор последовательности).
+ * Хост режет строку по границам символов, но полагаться на это нельзя:
+ * потерянный по дороге пакет даёт дырку в середине символа. Заменяем всё
+ * невалидное на '?', чтобы экран остался живым. */
 static void dash_sanitize_utf8(char *text) {
     uint8_t *p = (uint8_t *)text;
     uint8_t *out = (uint8_t *)text;
@@ -98,6 +114,8 @@ static void dash_sanitize_utf8(char *text) {
     *out = 0;
 }
 
+/* align: 0 влево, 1 центр, 2 вправо (старшие 4 бита байта font|align<<4).
+ * flags, бит 0: 1 — перенос по словам, 0 — обрезка по ширине. */
 static lv_obj_t *make_label(lv_obj_t *parent, uint16_t x, uint16_t y, uint16_t w, const lv_font_t *font, uint16_t color, uint8_t align, uint8_t flags) {
     lv_obj_t *label = lv_label_create(parent);
     lv_obj_set_pos(label, x, y);
@@ -112,12 +130,15 @@ static lv_obj_t *make_label(lv_obj_t *parent, uint16_t x, uint16_t y, uint16_t w
     return label;
 }
 
+/* Перерисовать один элемент. Объекты не пересоздаются без нужды: кадр
+ * приходит часто, а создание/удаление LVGL-объектов — самая дорогая часть. */
 static void dash_render_element(uint8_t index) {
     dash_element_t *element = &elements[index];
     if (!dash_root || !element->type) return;
 
     /* Тип элемента мог смениться (например, текст -> полоса). Нельзя
-     * переиспользовать label как контейнер: у него нет fill-объекта. */
+     * переиспользовать label как контейнер: у него нет fill-объекта, и он
+     * не умеет держать дочерние объекты так, как нужно полосе. */
     if (element->object && element->rendered_type != element->type) {
         if (element->fill) {
             lv_obj_del(element->fill);
@@ -138,7 +159,9 @@ static void dash_render_element(uint8_t index) {
         lv_obj_set_style_text_color(element->object, dash_color(element->color), 0);
         lv_obj_set_style_text_align(element->object, element->align == 0 ? LV_TEXT_ALIGN_LEFT : (element->align == 1 ? LV_TEXT_ALIGN_CENTER : LV_TEXT_ALIGN_RIGHT), 0);
         lv_label_set_long_mode(element->object, (element->flags & 0x01) ? LV_LABEL_LONG_WRAP : LV_LABEL_LONG_CLIP);
-        /* не трогаем label, если текст не изменился: меньше перерисовок и меньше churn в куче */
+        /* Не трогаем label, если текст не изменился: lv_label_set_text()
+         * инвалидирует объект и пересобирает строку в куче даже при том же
+         * содержимом, а кадры приходят регулярно. */
         dash_sanitize_utf8(element->text);
         const char *current = lv_label_get_text(element->object);
         if (!current || strcmp(current, element->text) != 0) lv_label_set_text(element->object, element->text);
@@ -158,6 +181,9 @@ static void dash_render_element(uint8_t index) {
         lv_obj_set_pos(element->object, element->x + SM62_DASH_PAD_LEFT, element->y + SM62_DASH_PAD_TOP);
         lv_obj_set_size(element->object, element->w, element->h);
         lv_obj_set_style_bg_color(element->object, dash_color(element->background), 0);
+        /* Заполнение = position/duration, с зажимом сверху: хост может
+         * прислать position больше duration (округления на его стороне),
+         * и полоса не должна вылезать за подложку. */
         uint32_t width = 0;
         if (element->duration) {
             uint32_t ratio = element->position >= element->duration ? element->duration : element->position;
@@ -192,6 +218,9 @@ static void dash_render(void) {
     dash_dirty = false;
 }
 
+/* BEGIN начинает новый кадр: количество элементов задаёт, сколько из них
+ * войдёт в кадр, остальные скрываются (сам кадр заменяет предыдущий целиком).
+ * target проверен вызывающим — сюда доходит только «наша» половина. */
 void sm62_dash_begin(uint8_t version, uint8_t target, uint8_t count) {
     (void)version;
     (void)target;
@@ -204,6 +233,9 @@ void sm62_dash_begin(uint8_t version, uint8_t target, uint8_t count) {
     }
 }
 
+/* Кусок строки. offset == 0 начинает новую строку, остальные куски
+ * дописываются по смещению. Резать по байтам нельзя: хост режет по границам
+ * UTF-8, а санитайзер в рендере страхует от потерянных пакетов. */
 void sm62_dash_text(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint8_t font, uint16_t color, uint8_t align, uint8_t flags, uint8_t offset, const uint8_t *data, uint8_t length) {
     if (id >= SM62_DASH_MAX_ELEMENTS) return;
     dash_element_t *element = &elements[id];
@@ -226,6 +258,8 @@ void sm62_dash_text(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint8_t 
     dash_dirty = true;
 }
 
+/* Полоса: подложка цвета background и заливка цвета color шириной pos/duration.
+ * Скругление берём от высоты (height/2), чтобы полоса выглядела капсулой. */
 void sm62_dash_bar(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t pos, uint32_t duration, uint16_t color, uint16_t background) {
     if (id >= SM62_DASH_MAX_ELEMENTS) return;
     dash_element_t *element = &elements[id];
@@ -243,6 +277,8 @@ void sm62_dash_bar(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint16_t 
     dash_dirty          = true;
 }
 
+/* Прямоугольник: подложка, разделитель, акцентная метка. radius приходит
+ * от хоста, потому что скругление — часть макета, а не свойство экрана. */
 void sm62_dash_rect(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t color, uint8_t radius) {
     if (id >= SM62_DASH_MAX_ELEMENTS) return;
     dash_element_t *element = &elements[id];
@@ -269,18 +305,24 @@ bool sm62_dash_has_frame(void) {
 static bool invert_pending;
 static bool invert_state;
 
+/* Запрос инверсии приходит из обработчика HID. К дисплею отсюда не
+ * прикасаемся: команда панели должна идти в одной транзакции с флашем,
+ * иначе ловим дедлок с идущей передачей по SPI. Поэтому только флаг,
+ * а применяет его housekeep (sm62_dash_apply_invert). */
 void sm62_dash_invert(bool on) {
-    /* Вызывается из обработчика HID: к дисплею отсюда не прикасаемся. */
     invert_state   = on;
     invert_pending = true;
 }
 
+/* Применяется из display_housekeeping_task, то есть всегда, независимо от
+ * активного экрана. Повторный вызов безопасен: без флага ничего не делает. */
 void sm62_dash_apply_invert(void) {
     if (!invert_pending) return;
     invert_pending = false;
     display_set_inverted(invert_state);
 }
 
+/* Уход с дашборда: гасим инверсию, иначе следующий экран останется в негативе. */
 void sm62_dash_reset_invert(void) {
     invert_state   = false;
     invert_pending = false;
@@ -304,8 +346,10 @@ static void dash_screen_load(void) {
     dash_dirty = true;
 }
 
+/* Штатное место отрисовки: главный цикл, вне обработчика USB и вне флаша.
+ * Инверсию здесь не применяем — её применяет display_housekeeping_task для
+ * всех экранов сразу, иначе на неактивном дашборде флаг мог бы залипнуть. */
 static void dash_screen_housekeep(void) {
-    sm62_dash_apply_invert();
     if (!dash_dirty) return;
     dash_screen_init();
     if (dash_root) dash_render();
