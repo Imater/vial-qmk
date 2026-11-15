@@ -197,6 +197,10 @@ static void dash_render_element(uint8_t index) {
     if (element->type == 3) {
         if (!element->object) {
             element->object = make_box(dash_root, element->x + SM62_DASH_PAD_LEFT, element->y + SM62_DASH_PAD_TOP, element->w, element->h, element->color, element->radius);
+            /* Прямоугольник — это подложка (фон футера, разделители). LVGL рисует
+             * объекты в порядке создания: только что созданный оказался бы поверх
+             * текста, который создан раньше. Уводим его в самый низ. */
+            if (element->object) lv_obj_move_background(element->object);
         }
         lv_obj_set_pos(element->object, element->x + SM62_DASH_PAD_LEFT, element->y + SM62_DASH_PAD_TOP);
         lv_obj_set_size(element->object, element->w, element->h);
