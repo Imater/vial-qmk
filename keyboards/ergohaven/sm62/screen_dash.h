@@ -12,7 +12,7 @@
 //   0xC3 RECT   [0xC3, target, id, x, y_lo, y_hi, w_lo, w_hi, h_lo, h_hi,
 //                color_lo, color_hi, radius]
 //   0xC4 COMMIT [0xC4, target] — показать накопленный кадр
-//   0xC5 SCREEN зарезервирован
+//   0xC5 SCREEN [0xC5, target, 0] — выйти из дашборда, вернуть штатный экран
 //   0xC6 INVERT [0xC6, target, on] — аппаратная инверсия панели
 //
 // target: 0 — левая половина, 1 — правая, 2 — обе. Адрес есть в каждом пакете,
@@ -57,6 +57,8 @@ void sm62_dash_text(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint8_t 
 void sm62_dash_bar(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint32_t pos, uint32_t duration, uint16_t color, uint16_t background);
 void sm62_dash_rect(uint8_t id, uint16_t x, uint16_t y, uint16_t width, uint16_t height, uint16_t color, uint8_t radius);
 void sm62_dash_commit(void);
+/* Выход из дашборда: следующий housekeeping вернёт штатный экран */
+void sm62_dash_exit(void);
 /* Только складывает запрос в флаг: к панели отсюда не прикасаемся */
 void sm62_dash_invert(bool on);
 /* Применяет накопленный запрос инверсии, вызывается из housekeep */

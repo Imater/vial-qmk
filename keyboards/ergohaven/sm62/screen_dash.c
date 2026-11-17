@@ -320,6 +320,16 @@ void sm62_dash_invert(bool on) {
 
 /* Применяется из display_housekeeping_task, то есть всегда, независимо от
  * активного экрана. Повторный вызов безопасен: без флага ничего не делает. */
+/* Хост сказал «выходи из дашборда». Экран выбирает display_modes по
+ * dash_frame_seen, поэтому достаточно снять флаг. Инверсию сбрасываем через
+ * отложенный флаг: из обработчика HID к панели прикасаться нельзя. */
+void sm62_dash_exit(void) {
+    dash_frame_seen = false;
+    dash_dirty     = false;
+    invert_state   = false;
+    invert_pending = true;
+}
+
 void sm62_dash_apply_invert(void) {
     if (!invert_pending) return;
     invert_pending = false;

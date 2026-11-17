@@ -39,6 +39,7 @@
 | `0xC2` | BAR | `[0xC2, target, id, x, y_lo, y_hi, w_lo, w_hi, h_lo, h_hi, pos(4 LE), dur(4 LE), fg_lo, fg_hi, bg_lo, bg_hi]` |
 | `0xC3` | RECT | `[0xC3, target, id, x, y_lo, y_hi, w_lo, w_hi, h_lo, h_hi, color_lo, color_hi, radius]` |
 | `0xC4` | COMMIT | `[0xC4, target]` |
+| `0xC5` | SCREEN | `[0xC5, target, 0]` — выйти из дашборда, вернуть штатный экран (хост шлёт при остановке демона) |
 | `0xC6` | INVERT | `[0xC6, target, on]` — аппаратная инверсия панели |
 
 Пояснения:

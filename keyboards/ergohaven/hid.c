@@ -898,7 +898,9 @@ static bool sm62_dash_process_packet(uint8_t *data, uint8_t length) {
             sm62_dash_commit();
             break;
         case _DASH_SCREEN:
-            /* зарезервировано под переключение экрана с хоста */
+            /* 0xC5, target, 0 — выйти из дашборда и вернуть штатный экран
+             * (хост присылает это при остановке демона) */
+            if (length >= 3 && data[2] == 0) sm62_dash_exit();
             break;
         case _DASH_INVERT:
             /* только флаг: к панели прикасаемся из housekeep, иначе дедлок
